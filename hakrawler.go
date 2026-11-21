@@ -46,6 +46,14 @@ func main() {
 	timeout := flag.Int("timeout", -1, "Maximum time to crawl each URL from stdin, in seconds.")
 	disableRedirects := flag.Bool("dr", false, "Disable following HTTP redirects.")
 
+	// Boundary-aware mode. All of these are inert unless -boundary is set,
+	// so the default behaviour is byte-identical to the legacy crawler.
+	boundary := flag.Bool("boundary", false, "Enable pre-enqueue boundary guards (depth/scope/rules), canonical dedup and end-of-run stats.")
+	scope := flag.String("scope", "host", "Scope mode when -boundary is set: host=seed host only, domain=same registrable domain incl. subdomains, whitelist=hosts from -whitelist.")
+	whitelistFlag := flag.String("whitelist", "", "Comma-separated hosts allowed when -scope=whitelist. E.g. -whitelist example.com,api.example.com")
+	rulesFlag := flag.String("rules", "", "Comma-separated custom exclusion rules of the form name=regex; evaluated before the built-in static-asset/junk rules.")
+	statsFile := flag.String("stats", "", "Write the JSON stats report to this path atomically (temp file + rename). Without it, JSON stats go to stderr.")
+
 	flag.Parse()
 
 	if *proxy != "" {
@@ -65,6 +73,28 @@ func main() {
 	if (stat.Mode() & os.ModeCharDevice) != 0 {
 		fmt.Fprintln(os.Stderr, "No urls detected. Hint: cat urls.txt | hakrawler")
 		os.Exit(1)
+	}
+
+	if *boundary {
+		// -subs is the legacy spelling of "same registrable domain incl.
+		// subdomains"; in boundary mode that maps onto -scope=domain.
+		scopeExplicit := false
+		flag.Visit(func(f *flag.Flag) {
+			if f.Name == "scope" {
+				scopeExplicit = true
+			}
+		})
+		effectiveScope := *scope
+		if *subsInScope {
+			if scopeExplicit && *scope != string(ScopeDomain) {
+				fmt.Fprintln(os.Stderr, "-subs conflicts with -scope="+*scope+"; use -scope=domain instead of combining them")
+				os.Exit(1)
+			}
+			effectiveScope = string(ScopeDomain)
+		}
+		os.Exit(runBoundaryMode(effectiveScope, *whitelistFlag, *rulesFlag, *statsFile,
+			*inside, *threads, *depth, *maxSize, *insecure, *showJson, *showSource,
+			*showWhere, *unique, *proxy, *timeout, *disableRedirects))
 	}
 
 	results := make(chan string, *threads)

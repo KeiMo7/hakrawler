@@ -1,0 +1,19 @@
+{
+  "seeds": 1,
+  "seeds_rejected": 0,
+  "extracted_links": 12370,
+  "candidate_links": 12370,
+  "enqueued": 83,
+  "depth_skipped": 150,
+  "scope_excluded": 656,
+  "rule_excluded": 1640,
+  "duplicate_skipped": 9841,
+  "invalid_links": 0,
+  "parse_errors": 0,
+  "fetch_errors": 0,
+  "timed_out_seeds": 0,
+  "rule_hits": {
+    "non-http-scheme": 328,
+    "static-asset": 1312
+  }
+}
