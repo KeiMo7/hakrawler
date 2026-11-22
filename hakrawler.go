@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -46,6 +47,14 @@ func main() {
 	timeout := flag.Int("timeout", -1, "Maximum time to crawl each URL from stdin, in seconds.")
 	disableRedirects := flag.Bool("dr", false, "Disable following HTTP redirects.")
 
+	// Resumable-crawl flags. Off by default; when -resume is absent the
+	// program behaves exactly as before (same output, same exit codes).
+	resumeDir := flag.String("resume", "", "Enable resumable crawling and store progress in this state directory. Re-run with the same directory to continue.")
+	resumeSync := flag.String("resume-sync", syncModeGroup, "Durability mode for the journal: 'group' batches fsyncs (fast, a crash redoes at most one sync window), 'strict' fsyncs every record (slowest, zero record loss on SIGKILL).")
+	resumeWindow := flag.Duration("resume-sync-window", defaultSyncWindow, "Max batching delay for -resume-sync=group before records are forced to disk.")
+	snapshotPath := flag.String("resume-snapshot", "", "Path for an exportable JSON snapshot of the queue/progress (defaults to <resume-dir>/queue-snapshot.json).")
+	snapshotInterval := flag.Duration("resume-snapshot-interval", 5*time.Second, "How often the queue snapshot is refreshed while resuming (0 disables periodic snapshots).")
+
 	flag.Parse()
 
 	if *proxy != "" {
@@ -67,12 +76,29 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Read all seeds up front. The single-shot path still consumes stdin line
+	// by line below; the resume path needs the full list to reconcile it with
+	// the stored seed set before any crawling starts.
+	seeds, readErr := readStdinSeeds()
+	if readErr != nil {
+		fmt.Fprintln(os.Stderr, "reading standard input:", readErr)
+		os.Exit(1)
+	}
+
+	if *resumeDir != "" {
+		runResumeCLI(seeds, crawlConfig{
+			inside: *inside, threads: *threads, depth: *depth, maxSize: *maxSize,
+			insecure: *insecure, subsInScope: *subsInScope, showJSON: *showJson,
+			showSource: *showSource, showWhere: *showWhere, proxy: *proxy,
+			timeout: *timeout, disableRedirects: *disableRedirects,
+		}, *resumeDir, *resumeSync, *resumeWindow, *snapshotPath, *snapshotInterval, *unique)
+		return
+	}
+
 	results := make(chan string, *threads)
 	go func() {
 		// get each line of stdin, push it to the work channel
-		s := bufio.NewScanner(os.Stdin)
-		for s.Scan() {
-			url := s.Text()
+		for _, url := range seeds {
 			hostname, err := extractHostname(url)
 			if err != nil {
 				log.Println("Error parsing URL:", err)
@@ -192,9 +218,6 @@ func main() {
 			}
 
 		}
-		if err := s.Err(); err != nil {
-			fmt.Fprintln(os.Stderr, "reading standard input:", err)
-		}
 		close(results)
 	}()
 
@@ -212,6 +235,119 @@ func main() {
 	for res := range results {
 		fmt.Fprintln(w, res)
 		urlsFound = true
+	}
+
+	if !urlsFound {
+		fmt.Fprintln(os.Stderr, "No URLs were found. This usually happens when a domain is specified (https://example.com), but it redirects to a subdomain (https://www.example.com). The subdomain is not included in the scope, so the no URLs are printed. In order to overcome this, either specify the final URL in the redirect chain or use the -subs option to include subdomains.")
+	}
+}
+
+// readStdinSeeds reads every non-empty stdin line as a seed URL, preserving
+// order and duplicates as given.
+func readStdinSeeds() ([]string, error) {
+	var out []string
+	s := bufio.NewScanner(os.Stdin)
+	s.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for s.Scan() {
+		line := strings.TrimSpace(s.Text())
+		if line != "" {
+			out = append(out, line)
+		}
+	}
+	return out, s.Err()
+}
+
+// runResumeCLI is the entry point of the resume-enabled path. All failure
+// modes exit non-zero with an explicit message and, where applicable, a
+// recovery instruction.
+func runResumeCLI(seeds []string, cfg crawlConfig, dir, syncMode string, syncWindow time.Duration, snapPath string, snapInterval time.Duration, unique bool) {
+	j, err := openJournal(dir, syncMode, syncWindow)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "resume:", err)
+		os.Exit(1)
+	}
+	defer j.Close()
+
+	added, err := j.InitSeeds(seeds)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "resume:", err)
+		os.Exit(1)
+	}
+	if len(added) > 0 {
+		fmt.Fprintf(os.Stderr, "resume: %d new seed(s) merged into the queue\n", len(added))
+	}
+	// Fold accumulated history back to one record per URL/output so long,
+	// repeatedly resumed crawls do not grow the journal without bound.
+	if err := j.Compact(); err != nil {
+		fmt.Fprintln(os.Stderr, "resume: journal compaction failed:", err)
+		os.Exit(1)
+	}
+
+	if snapPath == "" {
+		snapPath = filepath.Join(dir, "queue-snapshot.json")
+	}
+
+	// Periodic, throttled snapshot export so an operator can see which
+	// address the crawl is stuck on. Writes are atomic (tmp+rename).
+	stopSnap := make(chan struct{})
+	if snapInterval > 0 {
+		go func() {
+			t := time.NewTicker(snapInterval)
+			defer t.Stop()
+			for {
+				select {
+				case <-t.C:
+					if err := j.ExportSnapshot(snapPath); err != nil {
+						fmt.Fprintln(os.Stderr, "resume: snapshot export failed:", err)
+					}
+				case <-stopSnap:
+					return
+				}
+			}
+		}()
+	}
+
+	results := make(chan string, cfg.threads)
+	sink := channelSink{ch: results}
+
+	var runErr error
+	go func() {
+		runErr = runResume(cfg, j, seeds, unique, sink, func(Snapshot) {})
+		close(results)
+	}()
+
+	w := bufio.NewWriter(os.Stdout)
+	defer w.Flush()
+	urlsFound := false
+
+	// Output handling mirrors the single-shot path. With -u the same in-memory
+	// dedup is applied; without -u the journal already stores each result
+	// identity once per run chain, matching one-shot semantics for repeated
+	// discoveries within a crawl.
+	if unique {
+		for res := range results {
+			if isUnique(res) {
+				fmt.Fprintln(w, res)
+				urlsFound = true
+			}
+		}
+	} else {
+		for res := range results {
+			fmt.Fprintln(w, res)
+			urlsFound = true
+		}
+	}
+	close(stopSnap)
+
+	// Always leave a final, fresh snapshot behind (even on failure) so the
+	// queue position at exit is inspectable.
+	if err := j.ExportSnapshot(snapPath); err != nil {
+		fmt.Fprintln(os.Stderr, "resume: final snapshot export failed:", err)
+	}
+
+	if runErr != nil {
+		fmt.Fprintln(os.Stderr, "resume:", runErr)
+		os.Exit(1)
 	}
 
 	if !urlsFound {

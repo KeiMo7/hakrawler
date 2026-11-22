@@ -36,6 +36,40 @@ echo https://google.com | hakrawler -subs
 
 > Note: a common issue is that the tool returns no URLs. This usually happens when a domain is specified (https://example.com), but it redirects to a subdomain (https://www.example.com). The subdomain is not included in the scope, so the no URLs are printed. In order to overcome this, either specify the final URL in the redirect chain or use the `-subs` option to include subdomains.
 
+## Resumable crawling (survive reboots and interruptions)
+
+Long crawls can now persist their progress. This is **opt-in** with `-resume`;
+without it, behaviour, output and exit codes are unchanged.
+
+```sh
+# start a resumable crawl; progress is kept in ./crawl-state
+cat urls.txt | hakrawler -resume ./crawl-state
+
+# if the machine reboots or the process is killed, rerun the same command:
+# already-fetched addresses are skipped, failed ones are retried, and the
+# final link set is identical to a single uninterrupted crawl
+cat urls.txt | hakrawler -resume ./crawl-state
+```
+
+Key properties:
+
+- URL identity is the normalized address (fragment dropped, query parameters
+  sorted, host lower-cased), so different spellings of the same address are
+  fetched only once.
+- Progress is written atomically with per-line checksums; a half-written
+  record from a hard kill is detected and reported with recovery steps.
+- Adding new seed URLs merges them into the queue and reuses finished work;
+  replacing/removing old seeds is refused to avoid mis-attribution.
+- A queue snapshot (`<dir>/queue-snapshot.json`) shows completed/queued/failed
+  counts, the pending addresses and each failure's type, so you can see where
+  a crawl is stuck.
+- `-resume-sync group` (default) batches disk flushes and adds no measurable
+  overhead; `-resume-sync strict` flushes every record for zero-loss-on-kill at
+  a higher cost.
+
+See [RESUME.md](RESUME.md) for the full design, flags, durability/performance
+trade-offs, failure messages and compatibility boundaries.
+
 ## Example tool chain
 
 Get all subdomains of google, find the ones that respond to http(s), crawl them all.
@@ -103,6 +137,16 @@ Usage of hakrawler:
     	Output as JSON.
   -proxy string
     	Proxy URL. E.g. -proxy http://127.0.0.1:8080
+  -resume string
+    	Enable resumable crawling and store progress in this state directory. Re-run with the same directory to continue.
+  -resume-snapshot string
+    	Path for an exportable JSON snapshot of the queue/progress (defaults to <resume-dir>/queue-snapshot.json).
+  -resume-snapshot-interval duration
+    	How often the queue snapshot is refreshed while resuming (0 disables periodic snapshots). (default 5s)
+  -resume-sync string
+    	Durability mode for the journal: 'group' batches fsyncs (fast, a crash redoes at most one sync window), 'strict' fsyncs every record (slowest, zero record loss on SIGKILL). (default "group")
+  -resume-sync-window duration
+    	Max batching delay for -resume-sync=group before records are forced to disk. (default 50ms)
   -s	Show the source of URL based on where it was found. E.g. href, form, script, etc.
   -size int
     	Page size limit, in KB. (default -1)
